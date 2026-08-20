@@ -1,7 +1,5 @@
 //! Local paper matching. Fills against the live mark; nothing here signs.
 
-
-
 pub const STARTING_CASH: f64 = 10_000.0;
 pub const DEFAULT_LEVERAGE: f64 = 10.0;
 
@@ -124,15 +122,7 @@ impl PaperAccount {
             }
         });
         due.into_iter()
-            .map(|order| {
-                self.fill(
-                    order.id,
-                    &order.symbol,
-                    order.is_long,
-                    order.size,
-                    order.price,
-                )
-            })
+            .map(|order| self.fill(&order.symbol, order.is_long, order.size, order.price))
             .collect()
     }
 
