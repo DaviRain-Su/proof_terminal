@@ -11,7 +11,7 @@ use smol::channel::{Sender as EventSender, bounded as event_channel};
 
 const WS_POLL: Duration = Duration::from_millis(80);
 const MARKET_REFRESH: Duration = Duration::from_secs(120);
-const HISTORY_LIMIT: usize = 360;
+const HISTORY_LIMIT: usize = 720;
 const TRADE_LIMIT: usize = 40;
 
 type SeriesKey = (String, Timeframe);
@@ -47,6 +47,7 @@ fn run_feed(commands: Receiver<FeedCommand>, events: EventSender<FeedEvent>) {
     let mut timeframe = Timeframe::OneMinute;
     let mut series: HashMap<SeriesKey, Vec<Candle>> = HashMap::new();
     let mut listings: HashMap<String, MarketListing> = HashMap::new();
+    let mut markets_dirty = false;
     let mut live = LiveQuote::from_listing(MarketListing::placeholder(&symbol));
     let mut ws = PhoenixWs::connect(&symbol, timeframe).ok();
     let mut last_ws_attempt = Instant::now();
@@ -110,14 +111,17 @@ fn run_feed(commands: Receiver<FeedCommand>, events: EventSender<FeedEvent>) {
                     for _ in 0..32 {
                         match socket.poll(Duration::from_millis(1)) {
                             Ok(Some(event)) => {
-                                dirty |= apply_ws(
+                                let (quote_dirty, listing_dirty) = apply_ws(
                                     event,
                                     store.as_ref(),
                                     &mut series,
                                     &mut live,
+                                    &mut listings,
                                     &symbol,
                                     timeframe,
                                 );
+                                dirty |= quote_dirty;
+                                markets_dirty |= listing_dirty;
                                 backoff = Duration::from_secs(1);
                             }
                             Ok(None) => break,
@@ -150,6 +154,10 @@ fn run_feed(commands: Receiver<FeedCommand>, events: EventSender<FeedEvent>) {
                         dirty = true;
                     }
                 }
+                if markets_dirty {
+                    markets_dirty = false;
+                    emit_markets(&listings, &events);
+                }
                 if dirty {
                     emit_current(&live, &series, &events, &symbol, timeframe);
                 }
@@ -163,32 +171,54 @@ fn apply_ws(
     store: Option<&CandleStore>,
     series: &mut HashMap<SeriesKey, Vec<Candle>>,
     live: &mut LiveQuote,
+    listings: &mut HashMap<String, MarketListing>,
     symbol: &str,
     timeframe: Timeframe,
-) -> bool {
+) -> (bool, bool) {
     match event {
         WsEvent::Orderbook(book) => {
             live.book = book;
-            live.mark = live.mark.or(live.book.mid);
+            live.mid = live.book.mid.or(live.mid);
+            live.mark = live.mark.or(live.mid);
             live.fetched_at = Instant::now();
-            true
+            (true, false)
         }
         WsEvent::Market(tick) => {
             apply_tick(live, &tick);
             live.fetched_at = Instant::now();
-            true
+            if let Some(mark) = tick.mark.or(tick.mid)
+                && let Some(listing) = listings.get_mut(symbol)
+            {
+                listing.mark = Some(mark);
+                return (true, true);
+            }
+            (true, false)
         }
         WsEvent::Trades(trades) => {
             prepend_trades(&mut live.trades, trades);
             live.fetched_at = Instant::now();
-            true
+            (true, false)
+        }
+        WsEvent::Mids(mids) => {
+            let mut changed = false;
+            for (mid_symbol, price) in mids {
+                if let Some(listing) = listings.get_mut(&mid_symbol) {
+                    listing.mark = Some(price);
+                    changed = true;
+                }
+                if mid_symbol == symbol {
+                    live.mid = Some(price);
+                    live.mark = live.mark.or(Some(price));
+                }
+            }
+            (true, changed)
         }
         WsEvent::Candle {
             timeframe: candle_tf,
             candle,
         } => {
             if candle_tf != timeframe {
-                return false;
+                return (false, false);
             }
             let key = (symbol.to_owned(), timeframe);
             let mut candles = series.remove(&key).unwrap_or_default();
@@ -197,14 +227,33 @@ fn apply_ws(
                 let _ = store.upsert(symbol, timeframe, std::slice::from_ref(&candle));
             }
             series.insert(key, candles);
-            true
+            (true, false)
         }
     }
+}
+
+fn emit_markets(listings: &HashMap<String, MarketListing>, events: &EventSender<FeedEvent>) {
+    let mut markets: Vec<MarketListing> = listings.values().cloned().collect();
+    markets.sort_by(|left, right| {
+        market_rank(&left.symbol)
+            .cmp(&market_rank(&right.symbol))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    send_event(events, FeedEvent::Markets(markets));
 }
 
 fn apply_tick(quote: &mut LiveQuote, tick: &MarketTick) {
     if tick.mark.is_some() {
         quote.mark = tick.mark;
+    }
+    if tick.index.is_some() {
+        quote.index = tick.index;
+    }
+    if tick.mid.is_some() {
+        quote.mid = tick.mid;
+    }
+    if tick.prev_day.is_some() {
+        quote.prev_day = tick.prev_day;
     }
     if tick.funding_pct.is_some() {
         quote.funding_pct = tick.funding_pct;

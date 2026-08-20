@@ -26,6 +26,7 @@ pub enum WsEvent {
     Orderbook(OrderBook),
     Market(MarketTick),
     Trades(Vec<Trade>),
+    Mids(Vec<(String, f64)>),
     Candle {
         timeframe: Timeframe,
         candle: Candle,
@@ -35,6 +36,9 @@ pub enum WsEvent {
 #[derive(Clone, Debug, Default)]
 pub struct MarketTick {
     pub mark: Option<f64>,
+    pub index: Option<f64>,
+    pub mid: Option<f64>,
+    pub prev_day: Option<f64>,
     pub open_interest: Option<f64>,
     pub volume_24h: Option<f64>,
     pub change_24h_pct: Option<f64>,
@@ -113,6 +117,7 @@ impl PhoenixWs {
         };
         let symbol = &self.symbol;
         vec![
+            json!({ "type": kind, "subscription": { "channel": "allMids" } }),
             json!({ "type": kind, "subscription": { "channel": "orderbook", "symbol": symbol } }),
             json!({ "type": kind, "subscription": { "channel": "market", "symbol": symbol } }),
             json!({ "type": kind, "subscription": { "channel": "trades", "symbol": symbol } }),
@@ -173,6 +178,7 @@ fn parse_event(text: &str) -> Option<WsEvent> {
         "orderbook" => parse_orderbook(&value).map(WsEvent::Orderbook),
         "market" => Some(WsEvent::Market(parse_market(&value))),
         "trades" => Some(WsEvent::Trades(parse_trades(&value))),
+        "allMids" => Some(WsEvent::Mids(parse_mids(&value))),
         "candle" | "candles" => {
             let timeframe = value
                 .get("timeframe")
@@ -222,15 +228,20 @@ fn parse_orderbook(value: &Value) -> Option<OrderBook> {
 
 fn parse_market(value: &Value) -> MarketTick {
     let prev = number_field(value, &["prevDayPx", "prevDayPrice"]);
-    let mark = number_field(value, &["markPx", "markPrice", "midPx"]);
-    let change_24h_pct = match (mark, prev) {
-        (Some(mark), Some(prev)) if prev.abs() > f64::EPSILON => {
-            Some(((mark - prev) / prev) * 100.0)
+    let mark = number_field(value, &["markPx", "markPrice"]);
+    let mid = number_field(value, &["midPx", "mid"]);
+    let index = number_field(value, &["oraclePx", "indexPx", "indexPrice"]);
+    let change_24h_pct = match (mark.or(mid), prev) {
+        (Some(price), Some(prev)) if prev.abs() > f64::EPSILON => {
+            Some(((price - prev) / prev) * 100.0)
         }
         _ => None,
     };
     MarketTick {
-        mark,
+        mark: mark.or(mid),
+        index,
+        mid,
+        prev_day: prev,
         open_interest: number_field(value, &["openInterest", "openInterestBase"]),
         volume_24h: number_field(value, &["dayNtlVlm", "volume24h", "dayVolume"]),
         change_24h_pct,
@@ -244,6 +255,16 @@ fn funding_to_percent(value: f64) -> f64 {
     } else {
         value
     }
+}
+
+fn parse_mids(value: &Value) -> Vec<(String, f64)> {
+    value
+        .get("mids")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(symbol, price)| Some((symbol.clone(), parse_number(Some(price))?)))
+        .collect()
 }
 
 fn parse_trades(value: &Value) -> Vec<Trade> {
@@ -260,6 +281,7 @@ fn parse_trade(value: &Value) -> Option<Trade> {
     let price =
         number_field(value, &["price", "px"]).or_else(|| parse_number(value.get("price")))?;
     let size = number_field(value, &["size", "baseAmount", "baseQty", "sz"]).unwrap_or(0.0);
+    let notional = number_field(value, &["notional", "quoteAmount", "quoteQty"]);
     let side = value.get("side").and_then(Value::as_str).unwrap_or("");
     let is_buy = matches!(side, "bid" | "b" | "buy" | "Buy");
     let timestamp = value
@@ -275,6 +297,7 @@ fn parse_trade(value: &Value) -> Option<Trade> {
     Some(Trade {
         price,
         size: size.abs(),
+        notional,
         is_buy: if size < 0.0 {
             false
         } else {
@@ -298,6 +321,8 @@ fn parse_candle(value: &Value) -> Option<Candle> {
         low: number_field(value, &["low"])?,
         close: number_field(value, &["close"])?,
         volume: number_field(value, &["volume"]).unwrap_or(0.0),
+        volume_quote: number_field(value, &["volumeQuote"]),
+        trade_count: integer_field(value, &["tradeCount"]).map(|value| value.max(0) as u32),
     })
 }
 
@@ -383,6 +408,7 @@ mod tests {
         match market {
             Some(WsEvent::Market(tick)) => {
                 assert_eq!(tick.mark, Some(86.83));
+                assert_eq!(tick.prev_day, Some(77.48));
                 assert!((tick.funding_pct.unwrap() - 0.1936).abs() < 1e-6);
                 assert!((tick.change_24h_pct.unwrap() - 12.0676).abs() < 1e-3);
             }

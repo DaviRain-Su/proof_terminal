@@ -35,6 +35,20 @@ pub fn compact(value: f64) -> String {
     }
 }
 
+pub fn signed_price(value: f64) -> String {
+    if !value.is_finite() {
+        return "—".into();
+    }
+    let formatted = price(value.abs());
+    if value > 0.0 {
+        format!("+{formatted}")
+    } else if value < 0.0 {
+        format!("-{formatted}")
+    } else {
+        formatted
+    }
+}
+
 pub fn signed_percent(value: f64) -> String {
     if !value.is_finite() {
         return "—".into();
@@ -80,4 +94,15 @@ pub fn clock_label(timestamp: &str) -> String {
         return format!("{hours:02}:{minutes:02}:{secs:02}");
     }
     timestamp.to_owned()
+}
+
+pub fn bar_clock(time_ms: i64) -> String {
+    let seconds = if time_ms > 10_000_000_000 {
+        time_ms / 1000
+    } else {
+        time_ms
+    };
+    let hours = ((seconds.rem_euclid(86_400)) / 3_600) % 24;
+    let minutes = (seconds.rem_euclid(3_600)) / 60;
+    format!("{hours:02}:{minutes:02}")
 }

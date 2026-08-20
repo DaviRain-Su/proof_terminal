@@ -23,9 +23,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Timeframe {
+    OneSecond,
+    FiveSeconds,
     OneMinute,
     FiveMinutes,
     FifteenMinutes,
+    ThirtyMinutes,
     OneHour,
     FourHours,
     OneDay,
@@ -55,10 +58,13 @@ pub fn retry_after(error: &anyhow::Error) -> Option<Duration> {
 }
 
 impl Timeframe {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 9] = [
+        Self::OneSecond,
+        Self::FiveSeconds,
         Self::OneMinute,
         Self::FiveMinutes,
         Self::FifteenMinutes,
+        Self::ThirtyMinutes,
         Self::OneHour,
         Self::FourHours,
         Self::OneDay,
@@ -66,9 +72,12 @@ impl Timeframe {
 
     pub fn as_api(self) -> &'static str {
         match self {
+            Self::OneSecond => "1s",
+            Self::FiveSeconds => "5s",
             Self::OneMinute => "1m",
             Self::FiveMinutes => "5m",
             Self::FifteenMinutes => "15m",
+            Self::ThirtyMinutes => "30m",
             Self::OneHour => "1h",
             Self::FourHours => "4h",
             Self::OneDay => "1d",
@@ -81,9 +90,12 @@ impl Timeframe {
 
     pub fn from_api(value: &str) -> Option<Self> {
         match value {
+            "1s" => Some(Self::OneSecond),
+            "5s" => Some(Self::FiveSeconds),
             "1m" => Some(Self::OneMinute),
             "5m" => Some(Self::FiveMinutes),
             "15m" => Some(Self::FifteenMinutes),
+            "30m" => Some(Self::ThirtyMinutes),
             "1h" => Some(Self::OneHour),
             "4h" => Some(Self::FourHours),
             "1d" => Some(Self::OneDay),
@@ -93,9 +105,12 @@ impl Timeframe {
 
     pub fn duration_ms(self) -> i64 {
         match self {
+            Self::OneSecond => 1_000,
+            Self::FiveSeconds => 5_000,
             Self::OneMinute => 60_000,
             Self::FiveMinutes => 5 * 60_000,
             Self::FifteenMinutes => 15 * 60_000,
+            Self::ThirtyMinutes => 30 * 60_000,
             Self::OneHour => 60 * 60_000,
             Self::FourHours => 4 * 60 * 60_000,
             Self::OneDay => 24 * 60 * 60_000,
@@ -115,6 +130,7 @@ pub struct MarketListing {
     pub base_lots_decimals: u32,
     pub open_interest: f64,
     pub is_commodity: bool,
+    pub mark: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,12 +155,15 @@ pub struct Candle {
     pub low: f64,
     pub close: f64,
     pub volume: f64,
+    pub volume_quote: Option<f64>,
+    pub trade_count: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Trade {
     pub price: f64,
     pub size: f64,
+    pub notional: Option<f64>,
     pub is_buy: bool,
     pub timestamp: String,
 }
@@ -156,8 +175,12 @@ pub struct DeskSnapshot {
     pub name: String,
     pub status: String,
     pub mark: Option<f64>,
+    pub index: Option<f64>,
+    pub mid: Option<f64>,
+    pub prev_day: Option<f64>,
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
+    pub change_24h: Option<f64>,
     pub change_24h_pct: Option<f64>,
     pub volume_24h: Option<f64>,
     pub open_interest: Option<f64>,
@@ -175,6 +198,9 @@ pub struct DeskSnapshot {
 pub struct LiveQuote {
     pub listing: MarketListing,
     pub mark: Option<f64>,
+    pub index: Option<f64>,
+    pub mid: Option<f64>,
+    pub prev_day: Option<f64>,
     pub book: OrderBook,
     pub trades: Vec<Trade>,
     pub funding_pct: Option<f64>,
@@ -185,35 +211,33 @@ pub struct LiveQuote {
 }
 
 pub fn desk_from_live(live: LiveQuote, timeframe: Timeframe, candles: Vec<Candle>) -> DeskSnapshot {
-    let (change_24h_pct, volume_24h) = if timeframe == Timeframe::OneHour {
-        (
-            percent_change_from_candles(&candles),
-            if candles.is_empty() {
-                None
-            } else {
-                Some(
-                    candles
-                        .iter()
-                        .rev()
-                        .take(24)
-                        .map(|candle| candle.volume)
-                        .sum(),
-                )
-            },
-        )
-    } else {
-        (None, None)
+    let mark = live.mark.or(live.mid).or(live.book.mid);
+    let prev_day = live.prev_day;
+    let change_24h = match (mark, prev_day) {
+        (Some(mark), Some(prev)) => Some(mark - prev),
+        _ => None,
     };
+    let change_24h_pct = live.change_24h_pct.or_else(|| match (mark, prev_day) {
+        (Some(mark), Some(prev)) if prev.abs() > f64::EPSILON => {
+            Some(((mark - prev) / prev) * 100.0)
+        }
+        _ => percent_change_from_candles(&candles),
+    });
+    let _ = timeframe;
     DeskSnapshot {
         symbol: live.listing.symbol.clone(),
         timeframe,
         name: live.listing.name.clone(),
         status: live.listing.status.clone(),
-        mark: live.mark,
+        mark,
+        index: live.index,
+        mid: live.mid.or(live.book.mid),
+        prev_day,
         best_bid: live.book.bids.first().map(|level| level.price),
         best_ask: live.book.asks.first().map(|level| level.price),
-        change_24h_pct: live.change_24h_pct.or(change_24h_pct),
-        volume_24h: live.volume_24h.or(volume_24h),
+        change_24h,
+        change_24h_pct,
+        volume_24h: live.volume_24h,
         open_interest: live
             .open_interest
             .or(Some(live.listing.open_interest).filter(|value| *value > 0.0)),
@@ -351,7 +375,11 @@ impl PhoenixRest {
             .into_string()
             .with_context(|| format!("phoenix GET {url} body"))?;
         serde_json::from_str(&body).with_context(|| {
-            let preview = body.chars().take(120).collect::<String>().replace('\n', " ");
+            let preview = body
+                .chars()
+                .take(120)
+                .collect::<String>()
+                .replace('\n', " ");
             format!("phoenix GET {url} JSON: {preview}")
         })
     }
@@ -385,6 +413,7 @@ impl MarketListing {
             base_lots_decimals: 0,
             open_interest: 0.0,
             is_commodity: false,
+            mark: None,
         }
     }
 }
@@ -395,6 +424,9 @@ impl LiveQuote {
         Self {
             listing,
             mark: None,
+            index: None,
+            mid: None,
+            prev_day: None,
             book: OrderBook {
                 symbol,
                 bids: Vec::new(),
@@ -446,6 +478,7 @@ impl From<ApiMarket> for MarketListing {
                 .and_then(|value| value.get("isCommodity"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
+            mark: None,
         }
     }
 }
@@ -473,6 +506,8 @@ impl Candle {
             low: raw.low?,
             close: raw.close?,
             volume: raw.volume.unwrap_or(0.0),
+            volume_quote: raw.volume_quote,
+            trade_count: raw.trade_count,
         })
     }
 }
@@ -590,6 +625,10 @@ struct ApiCandle {
     close: Option<f64>,
     #[serde(default)]
     volume: Option<f64>,
+    #[serde(default)]
+    volume_quote: Option<f64>,
+    #[serde(default)]
+    trade_count: Option<u32>,
 }
 
 #[cfg(test)]
@@ -618,6 +657,8 @@ mod tests {
                 low: 79.0,
                 close: 80.5,
                 volume: 1.0,
+                volume_quote: None,
+                trade_count: None,
             },
             Candle {
                 time_ms: 1,
@@ -626,6 +667,8 @@ mod tests {
                 low: 80.0,
                 close: 88.0,
                 volume: 2.0,
+                volume_quote: None,
+                trade_count: None,
             },
         ];
         let change = percent_change_from_candles(&candles).unwrap();

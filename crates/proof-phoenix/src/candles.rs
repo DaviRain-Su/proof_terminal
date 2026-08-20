@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS candles (
     low REAL NOT NULL,
     close REAL NOT NULL,
     volume REAL NOT NULL,
+    volume_quote REAL,
+    trade_count INTEGER,
     PRIMARY KEY (symbol, timeframe, time_ms)
 );
 ";
@@ -45,6 +47,10 @@ impl CandleStore {
              PRAGMA synchronous=NORMAL;",
         )?;
         connection.execute_batch(SCHEMA)?;
+        let _ = connection.execute_batch(
+            "ALTER TABLE candles ADD COLUMN volume_quote REAL;
+             ALTER TABLE candles ADD COLUMN trade_count INTEGER;",
+        );
         Ok(Self { connection })
     }
 
@@ -55,7 +61,7 @@ impl CandleStore {
         limit: usize,
     ) -> anyhow::Result<Vec<Candle>> {
         let mut statement = self.connection.prepare(
-            "SELECT time_ms, open, high, low, close, volume
+            "SELECT time_ms, open, high, low, close, volume, volume_quote, trade_count
              FROM candles
              WHERE symbol = ?1 AND timeframe = ?2
              ORDER BY time_ms DESC
@@ -71,6 +77,12 @@ impl CandleStore {
                 low: row.get(3)?,
                 close: row.get(4)?,
                 volume: row.get(5)?,
+                volume_quote: row.get(6).ok().flatten(),
+                trade_count: row
+                    .get::<_, Option<i64>>(7)
+                    .ok()
+                    .flatten()
+                    .map(|value| value.max(0) as u32),
             });
         }
         candles.reverse();
@@ -89,14 +101,16 @@ impl CandleStore {
         let tx = self.connection.unchecked_transaction()?;
         {
             let mut statement = tx.prepare(
-                "INSERT INTO candles (symbol, timeframe, time_ms, open, high, low, close, volume)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO candles (symbol, timeframe, time_ms, open, high, low, close, volume, volume_quote, trade_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(symbol, timeframe, time_ms) DO UPDATE SET
                     open = excluded.open,
                     high = excluded.high,
                     low = excluded.low,
                     close = excluded.close,
-                    volume = excluded.volume",
+                    volume = excluded.volume,
+                    volume_quote = excluded.volume_quote,
+                    trade_count = excluded.trade_count",
             )?;
             for candle in candles {
                 statement.execute(params![
@@ -108,6 +122,8 @@ impl CandleStore {
                     candle.low,
                     candle.close,
                     candle.volume,
+                    candle.volume_quote,
+                    candle.trade_count.map(|value| value as i64),
                 ])?;
             }
         }
@@ -136,6 +152,8 @@ mod tests {
             low: 9.0,
             close: 10.5,
             volume: 1.0,
+            volume_quote: Some(10.5),
+            trade_count: Some(2),
         };
         store.upsert("SOL", Timeframe::OneMinute, &[first]).unwrap();
         let updated = Candle {
@@ -145,6 +163,8 @@ mod tests {
             low: 9.0,
             close: 11.5,
             volume: 3.0,
+            volume_quote: Some(34.5),
+            trade_count: Some(4),
         };
         store
             .upsert("SOL", Timeframe::OneMinute, &[updated])
@@ -165,6 +185,8 @@ mod tests {
                 low: index as f64,
                 close: index as f64,
                 volume: 1.0,
+                volume_quote: None,
+                trade_count: None,
             })
             .collect::<Vec<_>>();
         let window = window_candles(&candles, 4, 0);

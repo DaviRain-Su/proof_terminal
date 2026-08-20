@@ -14,7 +14,7 @@ use super::store::{FeedCommand, FeedEvent, spawn_feed};
 use crate::theme::Theme;
 use crate::ui::ActivationExt;
 
-const BOOK_DEPTH: usize = 12;
+const BOOK_DEPTH: usize = 16;
 const BOOK_ROW_HEIGHT: f32 = 18.0;
 const TRADE_ROW_HEIGHT: f32 = 18.0;
 const MARKET_ROW_HEIGHT: f32 = 28.0;
@@ -40,6 +40,7 @@ pub struct ProofDesk {
     chart_visible: usize,
     chart_offset: usize,
     chart_drag: Option<(f32, usize)>,
+    chart_hover: Option<(f32, f32)>,
 }
 
 impl ProofDesk {
@@ -64,9 +65,10 @@ impl ProofDesk {
                 ticket_side_long: true,
                 ticket_is_limit: true,
                 header_drag_armed: false,
-                chart_visible: 80,
+                chart_visible: 120,
                 chart_offset: 0,
                 chart_drag: None,
+                chart_hover: None,
             }
         });
 
@@ -205,12 +207,13 @@ impl ProofDesk {
     }
 
     fn reset_chart(&mut self, cx: &mut Context<Self>) {
-        if self.chart_visible == 80 && self.chart_offset == 0 && self.chart_drag.is_none() {
+        if self.chart_visible == 120 && self.chart_offset == 0 && self.chart_drag.is_none() {
             return;
         }
-        self.chart_visible = 80;
+        self.chart_visible = 120;
         self.chart_offset = 0;
         self.chart_drag = None;
+        self.chart_hover = None;
         cx.notify();
     }
 
@@ -273,7 +276,10 @@ impl Render for ProofDesk {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 this.handle_key(event, cx);
             }))
-            .on_mouse_move(cx.listener(Self::on_chart_drag))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                this.chart_hover = Some((f32::from(event.position.x), f32::from(event.position.y)));
+                Self::on_chart_drag(this, event, window, cx);
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_chart_drag(cx)),
@@ -321,14 +327,28 @@ impl ProofDesk {
         let left_controls = self.render_window_controls_left(window, cx);
         let right_controls = self.render_window_controls_right(window, cx);
         let mark = snapshot.and_then(|desk| desk.mark);
+        let index = snapshot.and_then(|desk| desk.index);
         let change = snapshot.and_then(|desk| desk.change_24h_pct);
+        let change_abs = snapshot.and_then(|desk| desk.change_24h);
         let change_up = change.unwrap_or(0.0) >= 0.0;
+        let change_label = match (change_abs, change) {
+            (Some(delta), Some(pct)) => format!(
+                "{} ({})",
+                format::signed_price(delta),
+                format::signed_percent(pct)
+            ),
+            (None, Some(pct)) => format::signed_percent(pct),
+            _ => "—".into(),
+        };
         let symbol = snapshot
             .map(|desk| desk.symbol.as_str())
             .unwrap_or(self.selected_symbol.as_str());
         let name = snapshot
             .map(|desk| desk.name.as_str())
             .unwrap_or("Phoenix Perp");
+        let leverage = snapshot
+            .and_then(|desk| desk.max_leverage)
+            .filter(|value| *value > 0.0);
 
         self.titlebar_drag(
             div()
@@ -338,7 +358,8 @@ impl ProofDesk {
                 .flex()
                 .items_center()
                 .px(px(12.0))
-                .gap(px(12.0))
+                .gap(px(10.0))
+                .overflow_hidden()
                 .border_b_1()
                 .border_color(theme.border)
                 .bg(theme.surface)
@@ -359,7 +380,13 @@ impl ProofDesk {
                                 .text_size(px(12.0))
                                 .text_color(theme.text_tertiary)
                                 .child(SharedString::from(name.to_owned())),
-                        ),
+                        )
+                        .children(leverage.map(|value| {
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_tertiary)
+                                .child(SharedString::from(format!("{value:.0}x")))
+                        })),
                 )
                 .child(stat_chip(
                     "Mark",
@@ -368,10 +395,14 @@ impl ProofDesk {
                     theme,
                 ))
                 .child(stat_chip(
-                    "24h",
-                    change
-                        .map(format::signed_percent)
-                        .unwrap_or_else(|| "—".into()),
+                    "Index",
+                    index.map(format::price).unwrap_or_else(|| "—".into()),
+                    theme.text_secondary,
+                    theme,
+                ))
+                .child(stat_chip(
+                    "24h Change",
+                    change_label,
                     if change_up {
                         theme.success
                     } else {
@@ -389,7 +420,7 @@ impl ProofDesk {
                     theme,
                 ))
                 .child(stat_chip(
-                    "Fund",
+                    "1h Funding",
                     snapshot
                         .and_then(|desk| desk.funding_pct)
                         .map(format::unsigned_percent)
@@ -398,7 +429,7 @@ impl ProofDesk {
                     theme,
                 ))
                 .child(stat_chip(
-                    "Vol",
+                    "24h Volume",
                     snapshot
                         .and_then(|desk| desk.volume_24h)
                         .map(format::compact)
@@ -541,7 +572,9 @@ impl ProofDesk {
                 div()
                     .text_size(px(10.0))
                     .text_color(theme.text_tertiary)
-                    .child(SharedString::from(if market.max_leverage > 0.0 {
+                    .child(SharedString::from(if let Some(mark) = market.mark {
+                        format::price(mark)
+                    } else if market.max_leverage > 0.0 {
                         format!("{}x", market.max_leverage as i64)
                     } else {
                         "—".into()
@@ -628,9 +661,14 @@ impl ProofDesk {
         let visible = self.chart_visible.max(20);
         let offset = self.chart_offset.min(candles.len().saturating_sub(visible));
         let windowed = window_candles(&candles, visible, offset);
+        let hover = self.chart_hover;
+        let hovered = hovered_candle(&windowed, hover, 56.0);
+        let last = windowed.last().copied();
+        let readout = hovered.or(last);
         let up = theme.success;
         let down = theme.danger;
         let grid = theme.border;
+        let overlay = theme.overlay;
         let focus = cx.focus_handle();
         div()
             .id("proof-chart")
@@ -640,6 +678,7 @@ impl ProofDesk {
             .flex_1()
             .min_h(px(180.0))
             .p(px(8.0))
+            .relative()
             .cursor(if self.chart_drag.is_some() {
                 CursorStyle::ClosedHand
             } else {
@@ -652,6 +691,8 @@ impl ProofDesk {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
                     this.chart_drag = Some((f32::from(event.position.x), this.chart_offset));
+                    this.chart_hover =
+                        Some((f32::from(event.position.x), f32::from(event.position.y)));
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -674,11 +715,40 @@ impl ProofDesk {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, _| {
-                        paint_candles(bounds, &windowed, up, down, grid, window);
+                        paint_candles(bounds, &windowed, hover, up, down, grid, overlay, window);
                     },
                 )
                 .size_full(),
             )
+            .children(readout.map(|candle| {
+                let color = if candle.close >= candle.open {
+                    theme.success
+                } else {
+                    theme.danger
+                };
+                div()
+                    .absolute()
+                    .top(px(6.0))
+                    .left(px(10.0))
+                    .flex()
+                    .gap(px(10.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.text_secondary)
+                    .child(SharedString::from(format::bar_clock(candle.time_ms)))
+                    .child(ohlc_chip(
+                        "O",
+                        format::price(candle.open),
+                        theme.text_secondary,
+                    ))
+                    .child(ohlc_chip("H", format::price(candle.high), color))
+                    .child(ohlc_chip("L", format::price(candle.low), color))
+                    .child(ohlc_chip("C", format::price(candle.close), color))
+                    .child(ohlc_chip(
+                        "V",
+                        format::compact(candle.volume),
+                        theme.text_secondary,
+                    ))
+            }))
     }
 
     fn on_chart_scroll(
@@ -722,7 +792,9 @@ impl ProofDesk {
     }
 
     fn on_chart_drag(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.chart_hover = Some((f32::from(event.position.x), f32::from(event.position.y)));
         let Some((origin_x, origin_offset)) = self.chart_drag else {
+            cx.notify();
             return;
         };
         let len = self.candles.len();
@@ -790,19 +862,23 @@ impl ProofDesk {
         let bids = snapshot
             .map(|desk| desk.book.bids[..desk.book.bids.len().min(BOOK_DEPTH)].to_vec())
             .unwrap_or_default();
-        let mid = snapshot.and_then(|desk| desk.mark.or(desk.book.mid));
-        let ask_rows = Arc::new(asks);
-        let bid_rows = Arc::new(bids);
+        let mid = snapshot.and_then(|desk| desk.mark.or(desk.mid).or(desk.book.mid));
+        let spread = match (bids.first(), asks.first()) {
+            (Some(bid), Some(ask)) => Some(ask.price - bid.price),
+            _ => None,
+        };
+        let ask_rows = Arc::new(with_totals(asks));
+        let bid_rows = Arc::new(with_totals(bids));
         let ask_max = ask_rows
-            .iter()
-            .map(|level| level.size)
-            .fold(0.0, f64::max)
-            .max(1.0);
+            .last()
+            .map(|level| level.total)
+            .filter(|value| *value > 0.0)
+            .unwrap_or(1.0);
         let bid_max = bid_rows
-            .iter()
-            .map(|level| level.size)
-            .fold(0.0, f64::max)
-            .max(1.0);
+            .last()
+            .map(|level| level.total)
+            .filter(|value| *value > 0.0)
+            .unwrap_or(1.0);
 
         div()
             .flex_1()
@@ -828,7 +904,7 @@ impl ProofDesk {
                     .px(px(10.0))
                     .flex()
                     .items_center()
-                    .justify_center()
+                    .justify_between()
                     .bg(theme.overlay)
                     .child(
                         div()
@@ -837,6 +913,15 @@ impl ProofDesk {
                             .child(SharedString::from(
                                 mid.map(format::price).unwrap_or_else(|| "—".into()),
                             )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_tertiary)
+                            .child(SharedString::from(match spread {
+                                Some(value) => format!("Spread {}", format::price(value)),
+                                None => "Spread —".into(),
+                            })),
                     ),
             )
             .child(div().flex_1().min_h(px(0.0)).child({
@@ -1094,6 +1179,28 @@ fn stat_chip(
         )
 }
 
+#[derive(Clone)]
+struct BookRow {
+    price: f64,
+    size: f64,
+    total: f64,
+}
+
+fn with_totals(levels: Vec<proof_phoenix::BookLevel>) -> Vec<BookRow> {
+    let mut total = 0.0;
+    levels
+        .into_iter()
+        .map(|level| {
+            total += level.size;
+            BookRow {
+                price: level.price,
+                size: level.size,
+                total,
+            }
+        })
+        .collect()
+}
+
 fn book_header(theme: Theme) -> impl IntoElement {
     div()
         .h(px(18.0))
@@ -1102,17 +1209,13 @@ fn book_header(theme: Theme) -> impl IntoElement {
         .text_size(px(10.0))
         .text_color(theme.text_ghost)
         .child(div().flex_1().child("Price"))
-        .child(div().w(px(72.0)).child("Size"))
+        .child(div().w(px(64.0)).child("Size"))
+        .child(div().w(px(64.0)).child("Total"))
 }
 
-fn book_row(
-    level: proof_phoenix::BookLevel,
-    bid: bool,
-    max_size: f64,
-    theme: Theme,
-) -> gpui::AnyElement {
+fn book_row(level: BookRow, bid: bool, max_total: f64, theme: Theme) -> gpui::AnyElement {
     let color = if bid { theme.success } else { theme.danger };
-    let fill_frac = (level.size / max_size).clamp(0.0, 1.0) as f32;
+    let fill_frac = (level.total / max_total).clamp(0.0, 1.0) as f32;
     div()
         .h(px(BOOK_ROW_HEIGHT))
         .px(px(10.0))
@@ -1137,10 +1240,17 @@ fn book_row(
         )
         .child(
             div()
-                .w(px(72.0))
+                .w(px(64.0))
                 .text_size(px(11.0))
                 .text_color(theme.text_secondary)
                 .child(SharedString::from(format::size(level.size))),
+        )
+        .child(
+            div()
+                .w(px(64.0))
+                .text_size(px(11.0))
+                .text_color(theme.text_tertiary)
+                .child(SharedString::from(format::size(level.total))),
         )
         .into_any_element()
 }
@@ -1237,13 +1347,15 @@ fn set_list_len(list: &ListState, len: usize) {
 fn paint_candles(
     bounds: Bounds<Pixels>,
     candles: &[proof_phoenix::Candle],
+    hover: Option<(f32, f32)>,
     up: gpui::Hsla,
     down: gpui::Hsla,
     grid: gpui::Hsla,
+    overlay: gpui::Hsla,
     window: &mut Window,
 ) {
     window.paint_quad(fill(bounds, gpui::transparent_black()));
-    if candles.len() < 2 {
+    if candles.is_empty() {
         return;
     }
     let width = f32::from(bounds.size.width);
@@ -1252,11 +1364,23 @@ fn paint_candles(
         return;
     }
 
+    let volume_h = (height * 0.22).clamp(28.0, 72.0);
+    let axis_w = 56.0;
+    let time_h = 16.0;
+    let plot_w = (width - axis_w).max(8.0);
+    let plot_h = (height - volume_h - time_h).max(24.0);
+    let origin_x = f32::from(bounds.origin.x);
+    let origin_y = f32::from(bounds.origin.y);
+    let volume_y = origin_y + plot_h;
+    let axis_x = origin_x + plot_w;
+
     let mut min = f64::MAX;
     let mut max = f64::MIN;
+    let mut max_volume = 0.0_f64;
     for candle in candles {
         min = min.min(candle.low);
         max = max.max(candle.high);
+        max_volume = max_volume.max(candle.volume);
     }
     if !min.is_finite() || !max.is_finite() || (max - min).abs() < f64::EPSILON {
         max = min + 1.0;
@@ -1265,23 +1389,31 @@ fn paint_candles(
     min -= pad;
     max += pad;
     let range = max - min;
+    if max_volume <= 0.0 {
+        max_volume = 1.0;
+    }
 
-    for fraction in [0.25, 0.5, 0.75] {
-        let y = bounds.origin.y + px(height * fraction);
+    for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+        let y = origin_y + plot_h * fraction;
         window.paint_quad(fill(
-            Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, px(1.0))),
+            Bounds::new(point(px(origin_x), px(y)), size(px(plot_w), px(1.0))),
             grid,
         ));
     }
 
-    let slot = width / candles.len() as f32;
-    let body_w = (slot * 0.62).clamp(1.0, 7.0);
+    window.paint_quad(fill(
+        Bounds::new(point(px(origin_x), px(volume_y)), size(px(plot_w), px(1.0))),
+        grid,
+    ));
+
+    let slot = plot_w / candles.len() as f32;
+    let body_w = (slot * 0.68).clamp(1.0, 9.0);
+    let y_of = |price: f64| {
+        let t = ((max - price) / range) as f32;
+        origin_y + t * plot_h
+    };
     for (index, candle) in candles.iter().enumerate() {
-        let x = f32::from(bounds.origin.x) + index as f32 * slot + slot / 2.0;
-        let y_of = |price: f64| {
-            let t = ((max - price) / range) as f32;
-            f32::from(bounds.origin.y) + t * height
-        };
+        let x = origin_x + index as f32 * slot + slot / 2.0;
         let high = y_of(candle.high);
         let low = y_of(candle.low);
         let open = y_of(candle.open);
@@ -1306,7 +1438,69 @@ fn paint_candles(
             ),
             color,
         ));
+        let vol_h = ((candle.volume / max_volume) as f32 * (volume_h - 6.0)).max(1.0);
+        window.paint_quad(fill(
+            Bounds::new(
+                point(px(x - body_w / 2.0), px(volume_y + volume_h - vol_h)),
+                size(px(body_w), px(vol_h)),
+            ),
+            color.opacity(0.45),
+        ));
     }
+
+    if let Some(candle) = candles.last() {
+        let y = y_of(candle.close).clamp(origin_y, origin_y + plot_h - 1.0);
+        window.paint_quad(fill(
+            Bounds::new(point(px(origin_x), px(y)), size(px(plot_w), px(1.0))),
+            overlay,
+        ));
+    }
+
+    if let Some((mouse_x, mouse_y)) = hover
+        && mouse_x >= origin_x
+        && mouse_x <= axis_x
+        && mouse_y >= origin_y
+        && mouse_y <= origin_y + height
+    {
+        let index = ((mouse_x - origin_x) / slot)
+            .floor()
+            .clamp(0.0, (candles.len() - 1) as f32) as usize;
+        let x = origin_x + index as f32 * slot + slot / 2.0;
+        window.paint_quad(fill(
+            Bounds::new(
+                point(px(x), px(origin_y)),
+                size(px(1.0), px(plot_h + volume_h)),
+            ),
+            overlay,
+        ));
+        window.paint_quad(fill(
+            Bounds::new(point(px(origin_x), px(mouse_y)), size(px(plot_w), px(1.0))),
+            overlay,
+        ));
+    }
+}
+
+fn hovered_candle(
+    candles: &[proof_phoenix::Candle],
+    hover: Option<(f32, f32)>,
+    axis_w: f32,
+) -> Option<proof_phoenix::Candle> {
+    let (mouse_x, _) = hover?;
+    if candles.is_empty() {
+        return None;
+    }
+    let index = ((mouse_x - axis_w).max(0.0) / 8.0)
+        .floor()
+        .clamp(0.0, (candles.len() - 1) as f32) as usize;
+    candles.get(index).copied()
+}
+
+fn ohlc_chip(label: &'static str, value: String, color: gpui::Hsla) -> impl IntoElement {
+    div()
+        .flex()
+        .gap(px(4.0))
+        .child(div().text_color(color.opacity(0.7)).child(label))
+        .child(div().text_color(color).child(SharedString::from(value)))
 }
 
 impl ProofDesk {
