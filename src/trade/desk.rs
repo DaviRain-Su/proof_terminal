@@ -4,15 +4,18 @@ use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight,
     InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent, Pixels, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Styled, Window, canvas, div, fill, list,
-    point, prelude::*, px, relative, size,
+    ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Styled, Subscription, Window, canvas,
+    div, fill, list, point, prelude::*, px, relative, size,
 };
 use proof_phoenix::{DeskSnapshot, MarketListing, Timeframe, window_candles};
 
 use super::format;
+use super::paper::{PaperAccount, PaperFill};
 use super::store::{FeedCommand, FeedEvent, spawn_feed};
+use crate::input::{ComposerEvent, ComposerInput};
 use crate::theme::Theme;
 use crate::ui::ActivationExt;
+use crate::ui::text_field::TextField;
 
 const BOOK_DEPTH: usize = 16;
 const BOOK_ROW_HEIGHT: f32 = 18.0;
@@ -36,11 +39,17 @@ pub struct ProofDesk {
     market_list: ListState,
     ticket_side_long: bool,
     ticket_is_limit: bool,
+    ticket_isolated: bool,
+    ticket_size: Entity<ComposerInput>,
+    ticket_price: Entity<ComposerInput>,
+    paper: PaperAccount,
+    last_fill: Option<String>,
     header_drag_armed: bool,
     chart_visible: usize,
     chart_offset: usize,
     chart_drag: Option<(f32, usize)>,
     chart_hover: Option<(f32, f32)>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ProofDesk {
@@ -48,6 +57,17 @@ impl ProofDesk {
         let (commands, events) = spawn_feed();
         let entity = cx.new(|cx| {
             let focus = cx.focus_handle();
+            let ticket_size = cx.new(|cx| {
+                ComposerInput::new(window, cx)
+                    .search_field()
+                    .placeholder("Size")
+            });
+            let ticket_price = cx.new(|cx| {
+                ComposerInput::new(window, cx)
+                    .search_field()
+                    .placeholder("Limit price")
+            });
+            ticket_size.update(cx, |input, cx| input.set_content("1", cx));
             Self {
                 focus,
                 commands,
@@ -64,16 +84,43 @@ impl ProofDesk {
                 market_list: ListState::new(0, ListAlignment::Top, px(80.0)),
                 ticket_side_long: true,
                 ticket_is_limit: true,
+                ticket_isolated: false,
+                ticket_size,
+                ticket_price,
+                paper: PaperAccount::new(),
+                last_fill: None,
                 header_drag_armed: false,
                 chart_visible: 120,
                 chart_offset: 0,
                 chart_drag: None,
                 chart_hover: None,
+                _subscriptions: Vec::new(),
             }
         });
 
         let focus = entity.read(cx).focus.clone();
         window.focus(&focus, cx);
+
+        let size_input = entity.read(cx).ticket_size.clone();
+        let price_input = entity.read(cx).ticket_price.clone();
+        entity.update(cx, |this, cx| {
+            this._subscriptions.push(cx.subscribe(
+                &size_input,
+                |this, _, event: &ComposerEvent, cx| {
+                    if matches!(event, ComposerEvent::Submit(_)) {
+                        this.submit_ticket(cx);
+                    }
+                },
+            ));
+            this._subscriptions.push(cx.subscribe(
+                &price_input,
+                |this, _, event: &ComposerEvent, cx| {
+                    if matches!(event, ComposerEvent::Submit(_)) {
+                        this.submit_ticket(cx);
+                    }
+                },
+            ));
+        });
 
         let feed = entity.downgrade();
         cx.spawn(async move |cx| {
@@ -105,6 +152,9 @@ impl ProofDesk {
                 }
                 self.last_error = None;
                 self.stale = false;
+                if let Some(mark) = snapshot.mark.or(snapshot.mid) {
+                    self.mark_paper(&snapshot.symbol, mark);
+                }
                 self.candles = snapshot.candles.clone();
                 self.sync_lists(&snapshot);
                 self.desk = Some(Arc::from(snapshot));
@@ -164,16 +214,81 @@ impl ProofDesk {
             return;
         }
         match event.keystroke.key.as_str() {
-            "1" => self.select_symbol("SOL".into(), cx),
-            "2" => self.select_symbol("BTC".into(), cx),
-            "3" => self.select_symbol("ETH".into(), cx),
             "=" | "+" => self.zoom_chart(true, cx),
             "-" => self.zoom_chart(false, cx),
             "left" => self.pan_chart(8, cx),
             "right" => self.pan_chart(-8, cx),
-            "home" | "0" => self.reset_chart(cx),
+            "home" => self.reset_chart(cx),
             _ => {}
         }
+    }
+
+    fn mark_from_desk(&self) -> Option<f64> {
+        self.desk
+            .as_ref()
+            .and_then(|desk| desk.mark.or(desk.mid).or(desk.book.mid))
+    }
+
+    fn mark_paper(&mut self, symbol: &str, mark: f64) {
+        let fills = self.paper.mark(symbol, mark);
+        if let Some(fill) = fills.last() {
+            self.last_fill = Some(fill_label(fill));
+        }
+    }
+
+    fn submit_ticket(&mut self, cx: &mut Context<Self>) {
+        let size = parse_number(self.ticket_size.read(cx).content());
+        let mark = self.mark_from_desk();
+        let limit_text = self.ticket_price.read(cx).content().trim();
+        let price = if self.ticket_is_limit {
+            parse_number(limit_text).or(mark)
+        } else {
+            mark
+        };
+        let Some(size) = size else {
+            self.last_error = Some("enter a size".into());
+            cx.notify();
+            return;
+        };
+        let Some(price) = price else {
+            self.last_error = Some("enter a price or wait for mark".into());
+            cx.notify();
+            return;
+        };
+        let Some(mark) = mark else {
+            self.last_error = Some("no mark yet".into());
+            cx.notify();
+            return;
+        };
+        match self.paper.place(
+            &self.selected_symbol,
+            self.ticket_side_long,
+            self.ticket_is_limit,
+            size,
+            price,
+            mark,
+        ) {
+            Ok(Some(fill)) => {
+                self.last_error = None;
+                self.last_fill = Some(fill_label(&fill));
+            }
+            Ok(None) => {
+                self.last_error = None;
+                self.last_fill = Some(format!(
+                    "resting {} {} {} @ {}",
+                    if self.ticket_side_long {
+                        "long"
+                    } else {
+                        "short"
+                    },
+                    format::size(size),
+                    self.selected_symbol,
+                    format::price(price)
+                ));
+            }
+            Err(error) => self.last_error = Some(error),
+        }
+        cx.notify();
     }
 
     fn zoom_chart(&mut self, zoom_in: bool, cx: &mut Context<Self>) {
@@ -599,7 +714,7 @@ impl ProofDesk {
             .flex_col()
             .child(self.render_timeframes(timeframe, theme, cx))
             .child(self.render_chart(candles, theme, cx))
-            .child(self.render_tables(theme))
+            .child(self.render_tables(theme, cx))
     }
 
     fn render_timeframes(
@@ -812,23 +927,146 @@ impl ProofDesk {
         cx.notify();
     }
 
-    fn render_tables(&self, theme: Theme) -> impl IntoElement {
+    fn render_tables(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let mark = self.mark_from_desk();
         div()
             .h(px(168.0))
             .flex_none()
             .flex()
             .border_t_1()
             .border_color(theme.border)
-            .child(locked_table(
-                "Positions",
-                "Connect a wallet to view positions",
-                theme,
-            ))
-            .child(locked_table(
-                "Open orders",
-                "No resting orders — live trading is later",
-                theme,
-            ))
+            .child(self.render_positions(mark, theme))
+            .child(self.render_open_orders(theme, cx))
+    }
+
+    fn render_positions(&self, mark: Option<f64>, theme: Theme) -> impl IntoElement {
+        let mut body = div()
+            .flex_1()
+            .px(px(12.0))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0));
+        if self.paper.positions.is_empty() {
+            body = body.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_ghost)
+                    .child("No paper positions"),
+            );
+        } else {
+            for position in &self.paper.positions {
+                let upnl = mark
+                    .map(|price| (price - position.entry) * position.size)
+                    .unwrap_or(0.0);
+                let color = if upnl >= 0.0 {
+                    theme.success
+                } else {
+                    theme.danger
+                };
+                let side = if position.size >= 0.0 {
+                    "Long"
+                } else {
+                    "Short"
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_size(px(12.0)).child(SharedString::from(format!(
+                            "{side} {} {}",
+                            format::size(position.size.abs()),
+                            position.symbol
+                        ))))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(color)
+                                .child(SharedString::from(format::signed_price(upnl))),
+                        ),
+                );
+                body = body.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(theme.text_tertiary)
+                        .child(SharedString::from(format!(
+                            "entry {} · {}x",
+                            format::price(position.entry),
+                            position.leverage as i64
+                        ))),
+                );
+            }
+        }
+        div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(theme.border)
+            .child(section_label("Positions", theme))
+            .child(body)
+    }
+
+    fn render_open_orders(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut body = div()
+            .flex_1()
+            .px(px(12.0))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0));
+        if self.paper.orders.is_empty() {
+            body = body.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_ghost)
+                    .child("No resting paper orders"),
+            );
+        } else {
+            for order in &self.paper.orders {
+                let id = order.id;
+                let side = if order.is_long { "Long" } else { "Short" };
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_size(px(12.0)).child(SharedString::from(format!(
+                            "{side} {} {} @ {}",
+                            format::size(order.size),
+                            order.symbol,
+                            format::price(order.price)
+                        ))))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("cancel-{id}")))
+                                .px(px(6.0))
+                                .h(px(18.0))
+                                .rounded(px(4.0))
+                                .flex()
+                                .items_center()
+                                .cursor_default()
+                                .bg(theme.overlay)
+                                .text_size(px(10.0))
+                                .text_color(theme.text_secondary)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.paper.cancel(id);
+                                    cx.notify();
+                                }))
+                                .child("Cancel"),
+                        ),
+                );
+            }
+        }
+        div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(section_label("Open orders", theme))
+            .child(body)
     }
 
     fn render_book_and_ticket(
@@ -942,11 +1180,15 @@ impl ProofDesk {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mark = snapshot.and_then(|desk| desk.mark);
+        let mark = snapshot.and_then(|desk| desk.mark.or(desk.mid));
         let long = self.ticket_side_long;
         let limit = self.ticket_is_limit;
+        let isolated = self.ticket_isolated;
+        let available = self.paper.available();
+        let submit_label = if long { "Buy / Long" } else { "Sell / Short" };
+        let submit_color = if long { theme.success } else { theme.danger };
         div()
-            .h(px(214.0))
+            .h(px(268.0))
             .flex_none()
             .flex()
             .flex_col()
@@ -959,8 +1201,12 @@ impl ProofDesk {
                 div()
                     .flex()
                     .gap(px(6.0))
-                    .child(self.mode_chip("Cross", true, theme, cx, |_| {}))
-                    .child(self.mode_chip("Isolated", false, theme, cx, |_| {})),
+                    .child(self.mode_chip("Cross", !isolated, theme, cx, |this| {
+                        this.ticket_isolated = false;
+                    }))
+                    .child(self.mode_chip("Isolated", isolated, theme, cx, |this| {
+                        this.ticket_isolated = true;
+                    })),
             )
             .child(
                 div()
@@ -980,23 +1226,42 @@ impl ProofDesk {
                     .child(self.side_chip("Long / Buy", true, long, theme, cx))
                     .child(self.side_chip("Short / Sell", false, !long, theme, cx)),
             )
-            .child(locked_field("Size", "0.00 SOL", theme))
-            .child(locked_field(
-                "Limit price",
-                mark.map(format::price).unwrap_or_else(|| "—".into()),
+            .child(ticket_field(
+                "Size",
+                TextField::new("ticket-size", self.ticket_size.clone()),
+                theme,
+            ))
+            .child(ticket_field(
+                if limit { "Limit price" } else { "Mark" },
+                TextField::new("ticket-price", self.ticket_price.clone()),
                 theme,
             ))
             .child(
                 div()
+                    .text_size(px(10.5))
+                    .text_color(theme.text_tertiary)
+                    .child(SharedString::from(format!(
+                        "Avail {} · {}x{}",
+                        format::compact(available),
+                        self.paper.leverage as i64,
+                        mark.map(|price| format!(" · mark {}", format::price(price)))
+                            .unwrap_or_default()
+                    ))),
+            )
+            .child(
+                div()
+                    .id("submit-ticket")
                     .h(px(28.0))
                     .rounded(px(6.0))
-                    .bg(theme.overlay)
+                    .bg(submit_color.opacity(0.22))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(11.5))
-                    .text_color(theme.text_tertiary)
-                    .child("Locked — connect wallet in P1"),
+                    .cursor_default()
+                    .text_size(px(12.0))
+                    .text_color(submit_color)
+                    .on_click(cx.listener(|this, _, _, cx| this.submit_ticket(cx)))
+                    .child(submit_label),
             )
     }
 
@@ -1106,13 +1371,26 @@ impl ProofDesk {
         error: Option<&str>,
         theme: Theme,
     ) -> impl IntoElement {
-        let health = "Health  —  wallet later";
+        let mark = snapshot.and_then(|desk| desk.mark.or(desk.mid));
+        let equity = self.paper.equity(|symbol| {
+            if snapshot.is_some_and(|desk| desk.symbol == symbol) {
+                mark
+            } else {
+                None
+            }
+        });
+        let health = format!(
+            "Paper  {} equity · {} avail",
+            format::compact(equity),
+            format::compact(self.paper.available())
+        );
         let status = snapshot
             .map(|desk| desk.status.clone())
             .unwrap_or_else(|| "loading".into());
         let detail = error
             .map(|error| error.to_owned())
-            .unwrap_or_else(|| format!("Phoenix {status} · paper mode · no signing"));
+            .or_else(|| self.last_fill.clone())
+            .unwrap_or_else(|| format!("Phoenix {status} · paper matching · no signing"));
         div()
             .h(px(28.0))
             .flex_none()
@@ -1127,7 +1405,7 @@ impl ProofDesk {
                 div()
                     .text_size(px(11.0))
                     .text_color(theme.text_tertiary)
-                    .child(health),
+                    .child(SharedString::from(health)),
             )
             .child(
                 div()
@@ -1290,52 +1568,41 @@ fn trade_row(trade: proof_phoenix::Trade, theme: Theme) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn locked_table(title: &'static str, empty: &'static str, theme: Theme) -> impl IntoElement {
-    div()
-        .flex_1()
-        .h_full()
-        .flex()
-        .flex_col()
-        .border_r_1()
-        .border_color(theme.border)
-        .child(section_label(title, theme))
-        .child(
-            div()
-                .flex_1()
-                .px(px(12.0))
-                .flex()
-                .items_center()
-                .text_size(px(12.0))
-                .text_color(theme.text_ghost)
-                .child(empty),
-        )
-}
-
-fn locked_field(label: &'static str, value: impl Into<String>, theme: Theme) -> impl IntoElement {
+fn ticket_field(label: &'static str, field: TextField, theme: Theme) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .justify_between()
+        .gap(px(8.0))
         .child(
             div()
+                .w(px(72.0))
                 .text_size(px(11.0))
                 .text_color(theme.text_ghost)
                 .child(label),
         )
-        .child(
-            div()
-                .h(px(24.0))
-                .px(px(8.0))
-                .min_w(px(92.0))
-                .rounded(px(5.0))
-                .bg(theme.inset)
-                .flex()
-                .items_center()
-                .justify_end()
-                .text_size(px(11.5))
-                .text_color(theme.text_secondary)
-                .child(SharedString::from(value.into())),
-        )
+        .child(field.flex_1())
+}
+
+fn parse_number(raw: &str) -> Option<f64> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn fill_label(fill: &PaperFill) -> String {
+    let side = if fill.is_long { "bought" } else { "sold" };
+    let pnl = if fill.realized.abs() > 1e-9 {
+        format!(" · {}", format::signed_price(fill.realized))
+    } else {
+        String::new()
+    };
+    format!(
+        "filled {side} {} {} @ {}{pnl}",
+        format::size(fill.size),
+        fill.symbol,
+        format::price(fill.price)
+    )
 }
 
 fn set_list_len(list: &ListState, len: usize) {
