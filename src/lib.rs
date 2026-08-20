@@ -28,20 +28,31 @@ macro_rules! tr_cow {
     };
 }
 
+#[allow(dead_code)]
 mod analytics;
+#[allow(dead_code)]
 mod app;
 mod assets;
+#[allow(dead_code)]
 mod browser;
+#[allow(dead_code)]
 mod computer_use;
+#[allow(dead_code)]
 pub mod daemon;
+#[allow(dead_code)]
 mod driver;
 mod input;
+#[allow(dead_code)]
 mod md;
 mod platform;
+#[allow(dead_code)]
 mod query;
+#[allow(dead_code)]
 mod review_diff;
+#[allow(dead_code)]
 mod terminal;
 mod theme;
+mod trade;
 mod ui;
 mod updater;
 
@@ -55,8 +66,8 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, point, px, size,
 };
 
-use crate::app::Waku;
 use crate::identity::{APP_ID, APP_NAME};
+use crate::trade::ProofDesk;
 actions!(
     waku,
     [
@@ -185,8 +196,6 @@ impl WakuApplicationExt for Application {
 }
 
 pub fn run() {
-    let daemon = crate::daemon::start_process()
-        .unwrap_or_else(|error| panic!("failed to start Waku daemon: {error:#}"));
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .with_main_window_reopen()
@@ -198,13 +207,6 @@ pub fn run() {
             crate::assets::register_fonts(cx).expect("failed to register bundled fonts");
             crate::input::init(cx);
             crate::ui::menu::init(cx);
-            crate::app::init_composer_autocomplete(cx);
-            crate::app::init_settings_keys(cx);
-            crate::app::init_command_palette(cx);
-            crate::app::init_commit_dialog_keys(cx);
-            crate::app::init_image_preview_keys(cx);
-            crate::app::init_sidebar_keys(cx);
-            crate::app::init_skills_keys(cx);
             crate::theme::init(cx);
             crate::platform::init_reduce_motion(cx);
 
@@ -337,31 +339,10 @@ pub fn run() {
                     },
                     move |window, cx| {
                         crate::platform::configure_main_window_close_behavior(window, cx);
-                        let waku = Waku::new(window, cx, daemon);
-                        let composer_focus = waku.read(cx).composer_focus(cx);
-                        window.focus(&composer_focus, cx);
-                        waku
+                        ProofDesk::new(window, cx)
                     },
                 )
                 .expect("failed to open Waku window");
-
-            cx.on_system_notification_response({
-                let window = window;
-                move |response, cx| {
-                    let Some(session_id) = crate::app::task_id_from_notification_tag(&response.tag)
-                    else {
-                        return;
-                    };
-                    window
-                        .update(cx, |waku, window, cx| {
-                            waku.open_task_from_notification(session_id, cx);
-                            window.activate_window();
-                            cx.activate(true);
-                        })
-                        .ok();
-                    cx.dismiss_system_notification(&response.tag);
-                }
-            });
 
             window
                 .update(cx, |_, window, cx| {

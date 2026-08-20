@@ -1,0 +1,19 @@
+[package]
+name = "proof-phoenix"
+version = "0.1.0"
+edition = "2024"
+description = "Phoenix perpetuals market-data adapter for Proof Terminal"
+license = "GPL-3.0-only"
+
+[dependencies]
+anyhow = "1.0"
+dirs = "6.0"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tungstenite = { version = "0.30", default-features = false, features = [
+    "handshake",
+    "rustls-tls-native-roots",
+] }
+ureq = { version = "2.12", features = ["json", "tls", "native-certs"] }

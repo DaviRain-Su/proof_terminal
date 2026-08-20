@@ -7,6 +7,7 @@ license = "GPL-3.0-only"
 
 [workspace]
 members = [
+    "crates/proof-phoenix",
     "crates/waku-client",
     "crates/waku-core",
     "crates/waku-daemon",
@@ -14,6 +15,7 @@ members = [
 ]
 default-members = [
     ".",
+    "crates/proof-phoenix",
     "crates/waku-client",
     "crates/waku-core",
     "crates/waku-daemon",
@@ -39,6 +41,7 @@ gpui_platform = { git = "https://github.com/egoist/zed", branch = "waku-webview"
     "x11",
 ] }
 parking_lot = "0.12"
+proof-phoenix = { path = "crates/proof-phoenix" }
 rquickjs = "0.12.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
